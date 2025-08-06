@@ -3,7 +3,6 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 import uvicorn
 import json
 import logging
-import socket
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -12,21 +11,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="局域网在线投屏")
 
 
-def get_local_ip():
-    """获取本机局域网IP地址"""
-    try:
-        # 创建一个UDP套接字连接到外部地址来获取本机IP
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-        return local_ip
-    except Exception:
-        return "localhost"
-
-# 简化的连接管理器
-
-
+# 连接管理器
 class ConnectionManager:
     def __init__(self):
         self.connections: list[WebSocket] = []
@@ -669,7 +654,6 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
 
 if __name__ == "__main__":
-    import asyncio
     import threading
     from fastapi import FastAPI
     import uvicorn
@@ -686,8 +670,6 @@ if __name__ == "__main__":
     def run_http_server():
         uvicorn.run(http_app, host="0.0.0.0", port=80, log_level="warning")
 
-    # 获取本地IP地址
-    local_ip = get_local_ip()
     print(f"投屏服务启动成功！")
     print("=" * 30)
 
