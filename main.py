@@ -2,20 +2,259 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 import uvicorn
 import json
-import logging
-import signal
-import sys
 import os
+import sys
 import subprocess
 import threading
-import time
 import socket
 import struct
 import asyncio
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import webbrowser
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+import datetime
+import ipaddress
 
-# 配置日志
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# 全局变量
+server_process = None
+server_thread = None
+shutdown_event = threading.Event()
+cert_file = "cert.pem"
+key_file = "key.pem"
+
+
+def get_local_ip():
+    """获取本机IP地址"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except:
+            return "127.0.0.1"
+
+
+def generate_certificate(key_path, cert_path):
+    """生成自签名证书"""
+    try:
+        private_key = rsa.generate_private_key(
+            public_exponent=65537, key_size=2048)
+        local_ip = get_local_ip()
+
+        subject = issuer = x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, "localhost"),
+        ])
+
+        cert = x509.CertificateBuilder().subject_name(
+            subject
+        ).issuer_name(
+            issuer
+        ).public_key(
+            private_key.public_key()
+        ).serial_number(
+            x509.random_serial_number()
+        ).not_valid_before(
+            datetime.datetime.now(datetime.UTC)
+        ).not_valid_after(
+            datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=3650)
+        ).add_extension(
+            x509.SubjectAlternativeName([
+                x509.DNSName("localhost"),
+                x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+                x509.IPAddress(ipaddress.IPv4Address(local_ip)),
+            ]),
+            critical=False,
+        ).sign(private_key, hashes.SHA256())
+
+        with open(key_path, "wb") as f:
+            f.write(private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption()
+            ))
+
+        with open(cert_path, "wb") as f:
+            f.write(cert.public_bytes(serialization.Encoding.PEM))
+
+        return True
+    except Exception:
+        return False
+
+
+class ScreenShareGUI:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("局域网在线投屏")
+        self.root.geometry("260x240")
+        self.root.resizable(False, False)
+
+        # 设置窗口图标
+        try:
+            # 获取程序所在目录
+            if hasattr(sys, '_MEIPASS'):
+                # 打包后的临时目录
+                icon_path = os.path.join(sys._MEIPASS, "icon.ico")
+            else:
+                # 开发环境
+                icon_path = "icon.ico"
+            self.root.iconbitmap(icon_path)
+        except:
+            pass  # 如果图标文件不存在就忽略
+
+        # 创建按钮
+        ttk.Button(self.root, text="启动服务",
+                   command=self.start_server, width=20).pack(pady=5)
+        ttk.Button(self.root, text="停止服务",
+                   command=self.stop_server, width=20).pack(pady=5)
+        ttk.Button(self.root, text="指定证书和密钥",
+                   command=self.select_cert, width=20).pack(pady=5)
+        ttk.Button(self.root, text="生成自签名证书",
+                   command=self.generate_cert, width=20).pack(pady=5)
+        ttk.Button(self.root, text="访问投屏页面",
+                   command=self.open_browser, width=20).pack(pady=5)
+        ttk.Button(self.root, text="关于", command=self.show_about,
+                   width=20).pack(pady=5)
+
+    def start_server(self):
+        global server_thread, shutdown_event
+        if server_thread and server_thread.is_alive():
+            messagebox.showwarning("警告", "服务已在运行")
+            return
+
+        if not os.path.exists(cert_file) or not os.path.exists(key_file):
+            messagebox.showerror("错误", "证书文件不存在，请先生成或指定证书")
+            return
+
+        shutdown_event.clear()
+        server_thread = threading.Thread(target=self.run_server, daemon=True)
+        server_thread.start()
+
+        # 启动后自动打开浏览器
+        threading.Timer(2.0, self.open_browser).start()
+
+    def run_server(self):
+        try:
+            # 启动HTTP重定向服务器
+            http_app = FastAPI()
+
+            @http_app.get("/{path:path}")
+            async def redirect_all(request: Request):
+                host = request.headers.get("host", "localhost").split(":")[0]
+                return RedirectResponse(url=f"https://{host}:443{request.url.path}", status_code=301)
+
+            http_thread = threading.Thread(
+                target=lambda: uvicorn.run(
+                    http_app, host="0.0.0.0", port=80, log_level="critical", access_log=False, log_config=None),
+                daemon=True
+            )
+            http_thread.start()
+
+            # 启动STUN服务器
+            stun_server = SimpleSTUNServer()
+            stun_thread = threading.Thread(
+                target=stun_server.start, daemon=True)
+            stun_thread.start()
+
+            # 启动HTTPS服务器
+            uvicorn.run(
+                app,
+                host="0.0.0.0",
+                port=443,
+                log_level="critical",
+                ssl_keyfile=key_file,
+                ssl_certfile=cert_file,
+                access_log=False,
+                log_config=None
+            )
+        except Exception as e:
+            messagebox.showerror("错误", f"服务启动失败: {e}")
+
+    def stop_server(self):
+        global server_thread, shutdown_event
+        shutdown_event.set()
+        if server_thread:
+            # 强制终止当前进程来停止服务器
+            os._exit(0)
+
+    def select_cert(self):
+        global cert_file, key_file
+        key_path = filedialog.askopenfilename(
+            title="选择私钥（key.pem）文件",
+            initialdir=os.getcwd(),
+            filetypes=[("PEM files", "*.pem"), ("All files", "*.*")]
+        )
+        if not key_path:
+            return
+
+        cert_path = filedialog.askopenfilename(
+            title="选择证书（cert.pem）文件",
+            initialdir=os.getcwd(),
+            filetypes=[("PEM files", "*.pem"), ("All files", "*.*")]
+        )
+        if not cert_path:
+            return
+
+        key_file = key_path
+        cert_file = cert_path
+        messagebox.showinfo("成功", "证书和密钥已设置")
+
+    def generate_cert(self):
+        key_path = filedialog.asksaveasfilename(
+            title="保存私钥（key.pem）文件",
+            initialdir=os.getcwd(),
+            defaultextension=".pem",
+            initialfile="key.pem",
+            filetypes=[("PEM files", "*.pem"), ("All files", "*.*")]
+        )
+        if not key_path:
+            return
+
+        cert_path = filedialog.asksaveasfilename(
+            title="保存证书（cert.pem）文件",
+            initialdir=os.getcwd(),
+            defaultextension=".pem",
+            initialfile="cert.pem",
+            filetypes=[("PEM files", "*.pem"), ("All files", "*.*")]
+        )
+        if not cert_path:
+            return
+
+        if generate_certificate(key_path, cert_path):
+            global cert_file, key_file
+            cert_file = cert_path
+            key_file = key_path
+            messagebox.showinfo("成功", "证书生成完成")
+        else:
+            messagebox.showerror("错误", "证书生成失败")
+
+    def open_browser(self):
+        local_ip = get_local_ip()
+        url = f"https://{local_ip}"
+        webbrowser.open(url)
+
+    def show_about(self):
+        about_text = """WebRTC投屏工具
+
+使用说明：
+1. 首次使用请先指定证书和密钥文件，或生成自签名证书
+2. 点击启动服务开始投屏服务
+3. 在其他设备浏览器访问本机IP地址
+4. 选择要投屏的屏幕或窗口
+
+https://github.com/AngelaCooljx/WebRTC_ScreenShare"""
+        messagebox.showinfo("关于", about_text)
+
+    def run(self):
+        self.root.mainloop()
+
 
 # 全局变量用于控制服务器状态
 shutdown_event = threading.Event()
@@ -759,143 +998,5 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
 
 if __name__ == "__main__":
-    import threading
-    from fastapi import FastAPI
-    import uvicorn
-
-    # 强制退出函数
-    def force_exit():
-        """强制杀死当前进程"""
-        try:
-            # 获取当前进程ID
-            pid = os.getpid()
-            print(f"\n强制退出程序 (PID: {pid})...")
-
-            # 使用taskkill强制杀死进程
-            if os.name == 'nt':  # Windows
-                subprocess.run(['taskkill', '/F', '/PID', str(pid)],
-                               capture_output=True, timeout=5)
-            else:  # Unix/Linux
-                os.kill(pid, signal.SIGKILL)
-        except Exception as e:
-            print(f"强制退出失败: {e}")
-            # 最后的手段
-            os._exit(1)
-
-    # 键盘监控线程 - 独立于asyncio事件循环
-    def keyboard_monitor():
-        """监控键盘输入的独立线程"""
-        try:
-            while True:
-                key = input()  # 等待用户输入
-                if key.lower() in ['q', 'quit', 'exit']:
-                    print("收到退出命令，立即强制退出...")
-                    pid = os.getpid()
-                    if os.name == 'nt':
-                        subprocess.Popen(['taskkill', '/F', '/PID', str(pid)],
-                                         creationflags=subprocess.CREATE_NO_WINDOW)
-                    os._exit(1)
-        except (EOFError, KeyboardInterrupt):
-            # 处理Ctrl+C或输入结束
-            print("\n检测到键盘中断，立即强制退出...")
-            pid = os.getpid()
-            if os.name == 'nt':
-                subprocess.Popen(['taskkill', '/F', '/PID', str(pid)],
-                                 creationflags=subprocess.CREATE_NO_WINDOW)
-            os._exit(1)
-        except Exception:
-            pass
-
-    # 信号处理函数
-    def signal_handler(signum, frame):
-        """处理Ctrl+C信号"""
-        print(f"\n收到退出信号 ({signum})，立即强制退出...")
-
-        # 直接强制退出，不等待
-        try:
-            pid = os.getpid()
-            print(f"强制杀死进程 (PID: {pid})...")
-            if os.name == 'nt':  # Windows
-                subprocess.Popen(['taskkill', '/F', '/PID', str(pid)],
-                                 creationflags=subprocess.CREATE_NO_WINDOW)
-            else:  # Unix/Linux
-                os.kill(pid, signal.SIGKILL)
-        except Exception:
-            pass
-        finally:
-            # 最后的手段
-            os._exit(1)
-
-    # 注册信号处理
-    if os.name == 'nt':  # Windows
-        signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
-        signal.signal(signal.SIGTERM, signal_handler)  # 终止信号
-    else:  # Unix/Linux
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
-
-    # 创建HTTP重定向应用
-    http_app = FastAPI()
-
-    @http_app.get("/{path:path}")
-    async def redirect_all(request: Request):
-        host = request.headers.get("host", "localhost").split(":")[0]
-        return RedirectResponse(url=f"https://{host}:443{request.url.path}", status_code=301)
-
-    # 启动HTTP重定向服务器
-    def run_http_server():
-        try:
-            uvicorn.run(
-                http_app,
-                host="0.0.0.0",
-                port=80,
-                log_level="warning",
-                log_config=None,
-                access_log=False
-            )
-        except Exception as e:
-            if not shutdown_event.is_set():
-                print(f"HTTP服务器错误: {e}")
-
-    print(f"投屏服务启动成功！")
-    print("=" * 30)
-    print("按 Ctrl+C 立即强制退出程序")
-    print("或者输入 'q' 然后按回车退出")
-    print("=" * 30)
-
-    # 启动内置STUN服务器
-    stun_server = SimpleSTUNServer()
-    stun_thread = threading.Thread(target=stun_server.start, daemon=True)
-    stun_thread.start()
-
-    # 启动键盘监控线程
-    keyboard_thread = threading.Thread(target=keyboard_monitor, daemon=True)
-    keyboard_thread.start()
-
-    # 在后台线程启动HTTP重定向服务器
-    http_thread = threading.Thread(target=run_http_server, daemon=True)
-    http_thread.start()
-
-    try:
-        # 启动HTTPS服务器
-        uvicorn.run(
-            app,
-            host="0.0.0.0",
-            port=443,
-            log_level="warning",
-            ssl_keyfile="key.pem",
-            ssl_certfile="cert.pem",
-            log_config=None,
-            access_log=False
-        )
-    except KeyboardInterrupt:
-        print("\n收到键盘中断，立即强制退出...")
-        # 直接强制退出
-        pid = os.getpid()
-        if os.name == 'nt':
-            subprocess.Popen(['taskkill', '/F', '/PID', str(pid)],
-                             creationflags=subprocess.CREATE_NO_WINDOW)
-        os._exit(1)
-    except Exception as e:
-        print(f"服务器启动失败: {e}")
-        force_exit()
+    gui = ScreenShareGUI()
+    gui.run()
