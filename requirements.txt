@@ -1,4 +1,4 @@
-fastapi
-uvicorn[standard]
-websockets
-cryptography
+fastapi>=0.116.1
+uvicorn[standard]>=0.35.0
+websockets>=15.0.1
+cryptography>=45.0.6

@@ -3,10 +3,19 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 import uvicorn
 import json
 import logging
+import signal
+import sys
+import os
+import subprocess
+import threading
+import time
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# 全局变量用于控制服务器状态
+shutdown_event = threading.Event()
 
 app = FastAPI(title="局域网在线投屏")
 
@@ -658,6 +667,77 @@ if __name__ == "__main__":
     from fastapi import FastAPI
     import uvicorn
 
+    # 强制退出函数
+    def force_exit():
+        """强制杀死当前进程"""
+        try:
+            # 获取当前进程ID
+            pid = os.getpid()
+            print(f"\n强制退出程序 (PID: {pid})...")
+
+            # 使用taskkill强制杀死进程
+            if os.name == 'nt':  # Windows
+                subprocess.run(['taskkill', '/F', '/PID', str(pid)],
+                               capture_output=True, timeout=5)
+            else:  # Unix/Linux
+                os.kill(pid, signal.SIGKILL)
+        except Exception as e:
+            print(f"强制退出失败: {e}")
+            # 最后的手段
+            os._exit(1)
+
+    # 键盘监控线程 - 独立于asyncio事件循环
+    def keyboard_monitor():
+        """监控键盘输入的独立线程"""
+        try:
+            while True:
+                key = input()  # 等待用户输入
+                if key.lower() in ['q', 'quit', 'exit']:
+                    print("收到退出命令，立即强制退出...")
+                    pid = os.getpid()
+                    if os.name == 'nt':
+                        subprocess.Popen(['taskkill', '/F', '/PID', str(pid)],
+                                         creationflags=subprocess.CREATE_NO_WINDOW)
+                    os._exit(1)
+        except (EOFError, KeyboardInterrupt):
+            # 处理Ctrl+C或输入结束
+            print("\n检测到键盘中断，立即强制退出...")
+            pid = os.getpid()
+            if os.name == 'nt':
+                subprocess.Popen(['taskkill', '/F', '/PID', str(pid)],
+                                 creationflags=subprocess.CREATE_NO_WINDOW)
+            os._exit(1)
+        except Exception:
+            pass
+
+    # 信号处理函数
+    def signal_handler(signum, frame):
+        """处理Ctrl+C信号"""
+        print(f"\n收到退出信号 ({signum})，立即强制退出...")
+
+        # 直接强制退出，不等待
+        try:
+            pid = os.getpid()
+            print(f"强制杀死进程 (PID: {pid})...")
+            if os.name == 'nt':  # Windows
+                subprocess.Popen(['taskkill', '/F', '/PID', str(pid)],
+                                 creationflags=subprocess.CREATE_NO_WINDOW)
+            else:  # Unix/Linux
+                os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+        finally:
+            # 最后的手段
+            os._exit(1)
+
+    # 注册信号处理
+    if os.name == 'nt':  # Windows
+        signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
+        signal.signal(signal.SIGTERM, signal_handler)  # 终止信号
+    else:  # Unix/Linux
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+
     # 创建HTTP重定向应用
     http_app = FastAPI()
 
@@ -668,21 +748,53 @@ if __name__ == "__main__":
 
     # 启动HTTP重定向服务器
     def run_http_server():
-        uvicorn.run(http_app, host="0.0.0.0", port=80, log_level="warning")
+        try:
+            uvicorn.run(
+                http_app,
+                host="0.0.0.0",
+                port=80,
+                log_level="warning",
+                log_config=None,
+                access_log=False
+            )
+        except Exception as e:
+            if not shutdown_event.is_set():
+                print(f"HTTP服务器错误: {e}")
 
     print(f"投屏服务启动成功！")
     print("=" * 30)
+    print("按 Ctrl+C 立即强制退出程序")
+    print("或者输入 'q' 然后按回车退出")
+    print("=" * 30)
+
+    # 启动键盘监控线程
+    keyboard_thread = threading.Thread(target=keyboard_monitor, daemon=True)
+    keyboard_thread.start()
 
     # 在后台线程启动HTTP重定向服务器
     http_thread = threading.Thread(target=run_http_server, daemon=True)
     http_thread.start()
 
-    # 启动HTTPS服务器
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=443,
-        log_level="warning",
-        ssl_keyfile="key.pem",
-        ssl_certfile="cert.pem"
-    )
+    try:
+        # 启动HTTPS服务器
+        uvicorn.run(
+            app,
+            host="0.0.0.0",
+            port=443,
+            log_level="warning",
+            ssl_keyfile="key.pem",
+            ssl_certfile="cert.pem",
+            log_config=None,
+            access_log=False
+        )
+    except KeyboardInterrupt:
+        print("\n收到键盘中断，立即强制退出...")
+        # 直接强制退出
+        pid = os.getpid()
+        if os.name == 'nt':
+            subprocess.Popen(['taskkill', '/F', '/PID', str(pid)],
+                             creationflags=subprocess.CREATE_NO_WINDOW)
+        os._exit(1)
+    except Exception as e:
+        print(f"服务器启动失败: {e}")
+        force_exit()
