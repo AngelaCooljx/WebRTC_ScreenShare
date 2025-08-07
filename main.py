@@ -9,6 +9,9 @@ import os
 import subprocess
 import threading
 import time
+import socket
+import struct
+import asyncio
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -16,6 +19,98 @@ logger = logging.getLogger(__name__)
 
 # 全局变量用于控制服务器状态
 shutdown_event = threading.Event()
+
+
+# 简单的STUN服务器实现
+class SimpleSTUNServer:
+    def __init__(self, host='0.0.0.0', port=3478):
+        self.host = host
+        self.port = port
+        self.socket = None
+        self.running = False
+
+    def start(self):
+        """启动STUN服务器"""
+        try:
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.socket.bind((self.host, self.port))
+            self.running = True
+
+            print(f"STUN服务器启动在 {self.host}:{self.port}")
+
+            while self.running and not shutdown_event.is_set():
+                try:
+                    self.socket.settimeout(1.0)  # 设置超时，以便检查shutdown_event
+                    data, addr = self.socket.recvfrom(1024)
+
+                    # 简单的STUN响应处理
+                    if len(data) >= 20:  # STUN消息最小长度
+                        response = self.create_stun_response(data, addr)
+                        if response:
+                            self.socket.sendto(response, addr)
+
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    if self.running:
+                        print(f"STUN服务器错误: {e}")
+                    break
+
+        except Exception as e:
+            print(f"STUN服务器启动失败: {e}")
+        finally:
+            if self.socket:
+                self.socket.close()
+
+    def create_stun_response(self, request_data, client_addr):
+        """创建STUN响应"""
+        try:
+            # 解析STUN请求头
+            if len(request_data) < 20:
+                return None
+
+            msg_type, msg_length, magic_cookie = struct.unpack(
+                '!HHI', request_data[:8])
+            transaction_id = request_data[8:20]
+
+            # 检查是否是STUN绑定请求
+            if msg_type == 0x0001 and magic_cookie == 0x2112A442:
+                # 创建成功响应
+                response_type = 0x0101  # Binding Success Response
+
+                # 创建XOR-MAPPED-ADDRESS属性
+                ip_bytes = socket.inet_aton(client_addr[0])
+                port = client_addr[1]
+
+                # XOR映射的IP和端口
+                xor_port = port ^ (magic_cookie >> 16)
+                xor_ip = struct.unpack('!I', ip_bytes)[0] ^ magic_cookie
+
+                # 构建属性
+                attr_type = 0x0020  # XOR-MAPPED-ADDRESS
+                attr_length = 8
+                attr_value = struct.pack(
+                    '!BBHI', 0, 1, xor_port, xor_ip)  # IPv4
+
+                # 构建完整响应
+                total_length = attr_length + 4  # 属性头 + 属性值
+                response = struct.pack(
+                    '!HHI', response_type, total_length, magic_cookie)
+                response += transaction_id
+                response += struct.pack('!HH', attr_type, attr_length)
+                response += attr_value
+
+                return response
+
+        except Exception as e:
+            print(f"创建STUN响应失败: {e}")
+
+        return None
+
+    def stop(self):
+        """停止STUN服务器"""
+        self.running = False
+
 
 app = FastAPI(title="局域网在线投屏")
 
@@ -279,8 +374,9 @@ async def get():
             // WebRTC 配置
             const rtcConfig = {
                 iceServers: [
-                    { urls: 'stun:stun.l.google.com:19302' },
-                    { urls: 'stun:stun1.l.google.com:19302' }
+                    { urls: `stun:${location.hostname}:3478` },  // 使用本机STUN服务器
+                    { urls: 'stun:stun.l.google.com:19302' },   // 备用公网STUN
+                    { urls: 'stun:stun1.l.google.com:19302' }   // 备用公网STUN
                 ]
             };
 
@@ -378,7 +474,7 @@ async def get():
                             mediaSource: 'screen',
                             width: { ideal: 1920 },
                             height: { ideal: 1080 },
-                            frameRate: { ideal: 15 }
+                            frameRate: { ideal: 30 }
                         },
                         audio: true
                     });
@@ -766,6 +862,11 @@ if __name__ == "__main__":
     print("按 Ctrl+C 立即强制退出程序")
     print("或者输入 'q' 然后按回车退出")
     print("=" * 30)
+
+    # 启动内置STUN服务器
+    stun_server = SimpleSTUNServer()
+    stun_thread = threading.Thread(target=stun_server.start, daemon=True)
+    stun_thread.start()
 
     # 启动键盘监控线程
     keyboard_thread = threading.Thread(target=keyboard_monitor, daemon=True)
